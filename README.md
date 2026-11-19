@@ -18,13 +18,9 @@ nixpkgs.overlays = [ inputs.quine-overlay.overlays.default ];
 ```
 
 It has no inputs of its own: it goes on top of whichever nixpkgs you use.
-petersweb-infra (`nixos/flake.nix`) uses it for every host.
 
 ## Adding one
 
 Add an entry to `overlay.nix` the way nixpkgs would have it (the same
 attribute path, `meta` included), and a row above. When nixpkgs gets it,
 delete the entry.
-
-The forge (forge.in.quineglobal.com/quine-global/nix-overlay) is the source;
-GitHub is its push mirror.
