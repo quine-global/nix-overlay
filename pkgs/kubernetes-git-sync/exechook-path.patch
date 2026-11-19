@@ -1,0 +1,173 @@
+diff --git a/README.md b/README.md
+index 99c04ac..2bcaa87 100644
+--- a/README.md
++++ b/README.md
+@@ -293,6 +293,14 @@ OPTIONS
+             must be idempotent.  This flag obsoletes --sync-hook-command, but
+             if sync-hook-command is specified, it will take precedence.
+ 
++    --exechook-path <string>, $GITSYNC_EXECHOOK_PATH
++            Run the --exechook-command only for hashes that change this git
++            pathspec (e.g. 'config/' or ':(glob)**/*.yaml') since the last
++            hash it succeeded on; other hashes are skipped.  The first hash
++            after startup always runs.  This flag may be specified more than
++            once, and the environment variable will be parsed like PATH -
++            using a colon (':') to separate elements.
++
+     --exechook-timeout <duration>, $GITSYNC_EXECHOOK_TIMEOUT
+             The timeout for the --exechook-command.  If not specifid, this
+             defaults to 30 seconds ("30s").
+diff --git a/main.go b/main.go
+index c3fa2b3..3daad38 100644
+--- a/main.go
++++ b/main.go
+@@ -35,6 +35,7 @@ import (
+ 	"os/signal"
+ 	"os/user"
+ 	"path/filepath"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -254,6 +255,9 @@ func main() {
+ 	flExechookBackoff := pflag.Duration("exechook-backoff",
+ 		envDuration(3*time.Second, "GITSYNC_EXECHOOK_BACKOFF", "GIT_SYNC_EXECHOOK_BACKOFF"),
+ 		"the time to wait before retrying a failed exechook")
++	flExechookPaths := pflag.StringArray("exechook-path",
++		envStringArray("", "GITSYNC_EXECHOOK_PATH"),
++		"run the exechook only for hashes that change this git pathspec (may be specified more than once)")
+ 
+ 	flPrePubExechookCommand := pflag.String("pre-publish-exechook-command",
+ 		envString("", "GITSYNC_PRE_PUBLISH_EXECHOOK_COMMAND"),
+@@ -952,6 +956,14 @@ func main() {
+ 			log,
+ 			*flOneTime,
+ 		)
++		if paths := slices.DeleteFunc(*flExechookPaths, func(p string) bool { return p == "" }); len(paths) > 0 {
++			exechookRunner.OnlyIf(func(ctx context.Context, from, to string) bool {
++				// Exit 0: no difference.  Anything else, including errors
++				// (e.g. `from` gone after a force-push): run the hook.
++				_, _, err := git.Run(ctx, git.root, append([]string{"diff", "--quiet", from, to, "--"}, paths...)...)
++				return err != nil
++			})
++		}
+ 		go exechookRunner.Run(context.Background())
+ 	}
+ 
+@@ -2675,6 +2687,14 @@ OPTIONS
+             This flag obsoletes --sync-hook-command, but if sync-hook-command
+             is specified, it will take precedence.
+ 
++    --exechook-path <string>, $GITSYNC_EXECHOOK_PATH
++            Run the --exechook-command only for hashes that change this git
++            pathspec (e.g. 'config/' or ':(glob)**/*.yaml') since the last
++            hash it succeeded on; other hashes are skipped.  The first hash
++            after startup always runs.  This flag may be specified more than
++            once, and the environment variable will be parsed like PATH -
++            using a colon (':') to separate elements.
++
+     --exechook-timeout <duration>, $GITSYNC_EXECHOOK_TIMEOUT
+             The timeout for the --exechook-command.  If not specifid, this
+             defaults to 30 seconds ("30s").
+diff --git a/pkg/hook/hook.go b/pkg/hook/hook.go
+index dc72f32..ccfe503 100644
+--- a/pkg/hook/hook.go
++++ b/pkg/hook/hook.go
+@@ -110,6 +110,15 @@ type HookRunner struct {
+ 	// Used to send a status result when running in one-time mode.
+ 	// Should be initialised to a buffered channel of size 1.
+ 	oneTimeResult chan bool
++	// If set, the hook is skipped for a hash when this says nothing it cares
++	// about changed since the last hash it succeeded on.
++	changed func(ctx context.Context, from, to string) bool
++}
++
++// OnlyIf makes the runner skip hashes for which changed(lastSuccess, hash)
++// is false.  The first hash after startup always runs.
++func (r *HookRunner) OnlyIf(changed func(ctx context.Context, from, to string) bool) {
++	r.changed = changed
+ }
+ 
+ // Just the logr methods we need in this package.
+@@ -139,6 +148,11 @@ func (r *HookRunner) Run(ctx context.Context) {
+ 			if hash == lastHash {
+ 				break
+ 			}
++			if r.changed != nil && lastHash != "" && !r.changed(ctx, lastHash, hash) {
++				r.log.V(0).Info("skipping hook: nothing it watches changed", "hash", hash, "since", lastHash)
++				lastHash = hash
++				break
++			}
+ 
+ 			if err := r.hook.Do(ctx, hash); err != nil {
+ 				r.log.Error(err, "hook failed", "hash", hash, "retry", r.backoff)
+diff --git a/pkg/hook/hook_test.go b/pkg/hook/hook_test.go
+index 5847630..8cd949f 100644
+--- a/pkg/hook/hook_test.go
++++ b/pkg/hook/hook_test.go
+@@ -17,8 +17,12 @@ limitations under the License.
+ package hook
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"testing"
++	"time"
++
++	"k8s.io/git-sync/pkg/logging"
+ )
+ 
+ const (
+@@ -78,3 +82,52 @@ func TestHookData(t *testing.T) {
+ 		}
+ 	})
+ }
++
++type recordingHook struct{ ran chan string }
++
++func (h recordingHook) Name() string { return "recording" }
++func (h recordingHook) Do(_ context.Context, hash string) error {
++	h.ran <- hash
++	return nil
++}
++
++func TestHookRunnerOnlyIf(t *testing.T) {
++	hash3 := "3333333333333333333333333333333333333333"
++	h := recordingHook{ran: make(chan string, 3)}
++	asked := make(chan [2]string, 3)
++	r := NewHookRunner(h, time.Millisecond, NewHookData(), logging.New("", "", 0), false)
++	r.OnlyIf(func(_ context.Context, from, to string) bool {
++		asked <- [2]string{from, to}
++		return to == hash3
++	})
++	go r.Run(context.Background())
++
++	wait := func(ch any) any {
++		select {
++		case v := <-ch.(chan string):
++			return v
++		case <-time.After(5 * time.Second):
++			t.Fatal("timed out")
++		}
++		return nil
++	}
++
++	// The first hash runs without asking.
++	r.Send(hash1)
++	if got := wait(h.ran); got != hash1 {
++		t.Fatalf("ran %v, want %s", got, hash1)
++	}
++	// hash2 changes nothing watched: skipped.
++	r.Send(hash2)
++	if got := <-asked; got != [2]string{hash1, hash2} {
++		t.Fatalf("asked %v", got)
++	}
++	// hash3 does, and is compared with hash2, the skipped one.
++	r.Send(hash3)
++	if got := <-asked; got != [2]string{hash2, hash3} {
++		t.Fatalf("asked %v", got)
++	}
++	if got := wait(h.ran); got != hash3 {
++		t.Fatalf("ran %v, want %s", got, hash3)
++	}
++}

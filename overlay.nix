@@ -1,6 +1,13 @@
 # Quine's additions to nixpkgs: only what nixpkgs lacks. Each is written so
 # it could go upstream, and goes away when upstream has it.
 final: prev: {
+  # Kubernetes' git-sync, with our --exechook-path (nixpkgs' `git-sync` is
+  # another tool): pkgs/kubernetes-git-sync/.
+  kubernetes-git-sync = final.callPackage ./pkgs/kubernetes-git-sync/package.nix {};
+
+  # mcli, the maintained fork of MinIO's mc: pkgs/mcli/.
+  mcli = final.callPackage ./pkgs/mcli/package.nix {};
+
   # samizdatco/nginx-http-auth-digest: HTTP Digest Authentication (RFC 2617)
   # for nginx, as `nginxModules.auth-digest` (services.nginx.additionalModules).
   nginxModules =
